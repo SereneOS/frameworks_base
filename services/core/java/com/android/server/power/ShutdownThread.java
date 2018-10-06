@@ -20,7 +20,6 @@ package com.android.server.power;
 import android.app.AlertDialog;
 import android.app.Dialog;
 import android.app.IActivityManager;
-import android.app.ProgressDialog;
 import android.app.admin.SecurityLog;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -48,6 +47,7 @@ import android.util.TimingsTraceLog;
 import android.view.WindowManager;
 
 import com.android.internal.telephony.ITelephony;
+import com.android.internal.util.ShutdownDialog;
 import com.android.server.RescueParty;
 import com.android.server.LocalServices;
 import com.android.server.pm.PackageManagerService;
@@ -130,7 +130,7 @@ public final class ShutdownThread extends Thread {
     private Handler mHandler;
 
     private static AlertDialog sConfirmDialog;
-    private ProgressDialog mProgressDialog;
+    private ShutdownDialog mShutdownDialog = null;
 
     private ShutdownThread() {
     }
@@ -140,7 +140,7 @@ public final class ShutdownThread extends Thread {
      * state etc.  Must be called from a Looper thread in which its UI
      * is shown.
      *
-     * @param context Context used to display the shutdown progress dialog. This must be a context
+     * @param context Context used to display the shutdown dialog. This must be a context
      *                suitable for displaying UI (aka Themable).
      * @param reason code to pass to android_reboot() (e.g. "userrequested"), or null.
      * @param confirm true if user confirmation is needed before shutting down.
@@ -338,12 +338,22 @@ public final class ShutdownThread extends Thread {
         shutdownInner(context, confirm);
     }
 
-    private static ProgressDialog showShutdownDialog(Context context) {
+    private static void beginShutdownSequence(Context context) {
+        synchronized (sIsStartedGuard) {
+            if (sIsStarted) {
+                Log.d(TAG, "Shutdown sequence already running, returning.");
+                return;
+            }
+            sIsStarted = true;
+        }
+
         // Throw up a system dialog to indicate the device is rebooting / shutting down.
-        ProgressDialog pd = new ProgressDialog(context);
+        ShutdownDialog sd = null;
+        int mAction = 2;
 
         // Path 1: Reboot to recovery for update
         //   Condition: mReason startswith REBOOT_RECOVERY_UPDATE
+        //   mAction = 0
         //
         //  Path 1a: uncrypt needed
         //   Condition: if /cache/recovery/uncrypt_file exists but
@@ -359,10 +369,13 @@ public final class ShutdownThread extends Thread {
         // Path 2: Reboot to recovery for factory reset
         //   Condition: mReason == REBOOT_RECOVERY
         //   UI: spinning circle only (no progress bar)
+        //   mAction = 1
         //
         // Path 3: Regular reboot / shutdown
         //   Condition: Otherwise
         //   UI: spinning circle only (no progress bar)
+        //   mAction = 2 (reboot)
+        //   mAction = 3 (shutdown)
 
         // mReason could be "recovery-update" or "recovery-update,quiescent".
         if (mReason != null && mReason.startsWith(PowerManager.REBOOT_RECOVERY_UPDATE)) {
@@ -370,152 +383,26 @@ public final class ShutdownThread extends Thread {
             // reboot, which might be time-consuming.
             mRebootHasProgressBar = RecoverySystem.UNCRYPT_PACKAGE_FILE.exists()
                     && !(RecoverySystem.BLOCK_MAP_FILE.exists());
-            pd.setTitle(context.getText(com.android.internal.R.string.reboot_to_update_title));
             if (mRebootHasProgressBar) {
-                pd.setMax(100);
-                pd.setProgress(0);
-                pd.setIndeterminate(false);
-                pd.setProgressNumberFormat(null);
-                pd.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
-                pd.setMessage(context.getText(
-                            com.android.internal.R.string.reboot_to_update_prepare));
+                sd = ShutdownDialog.create(context, 0);
             } else {
-                if (showSysuiReboot()) {
-                    return null;
-                }
-                pd.setIndeterminate(true);
-                pd.setMessage(context.getText(
-                            com.android.internal.R.string.reboot_to_update_reboot));
+                sd = ShutdownDialog.create(context, 1);
             }
         } else if (mReason != null && mReason.equals(PowerManager.REBOOT_RECOVERY)) {
             if (RescueParty.isAttemptingFactoryReset()) {
-                // We're not actually doing a factory reset yet; we're rebooting
-                // to ask the user if they'd like to reset, so give them a less
-                // scary dialog message.
-                pd.setTitle(context.getText(com.android.internal.R.string.power_off));
-                pd.setMessage(context.getText(com.android.internal.R.string.shutdown_progress));
-                pd.setIndeterminate(true);
+		sd = ShutdownDialog.create(context, 3);
             } else {
-                if (showSysuiReboot()) {
-                    return null;
-                }
-                // Factory reset path. Set the dialog message accordingly.
-                pd.setTitle(context.getText(com.android.internal.R.string.reboot_to_recovery_title));
-                pd.setMessage(context.getText(
-                            com.android.internal.R.string.reboot_to_recovery_message));
-                pd.setIndeterminate(true);
+		sd = ShutdownDialog.create(context, 2);
             }
         } else if (mReason != null && mReason.equals(PowerManager.REBOOT_BOOTLOADER)) {
-            if (showSysuiReboot()) {
-                return null;
-            }
-            pd.setTitle(context.getText(com.android.internal.R.string.reboot_to_bootloader_title));
-            pd.setMessage(context.getText(
-                        com.android.internal.R.string.reboot_to_bootloader_message));
-            pd.setIndeterminate(true);
+		sd = ShutdownDialog.create(context, 2);
         } else if (mReboot) {
-            if (showSysuiReboot()) {
-                return null;
-            }
-            pd.setTitle(context.getText(com.android.internal.R.string.reboot_title));
-            pd.setMessage(context.getText(com.android.internal.R.string.reboot_message));
-            pd.setIndeterminate(true);
+		sd = ShutdownDialog.create(context, 2);
         } else {
-            if (showSysuiReboot()) {
-                return null;
-            }
-            pd.setTitle(context.getText(com.android.internal.R.string.power_off));
-            pd.setMessage(context.getText(com.android.internal.R.string.shutdown_progress));
-            pd.setIndeterminate(true);
-        }
-        pd.setCancelable(false);
-        pd.getWindow().setType(WindowManager.LayoutParams.TYPE_KEYGUARD_DIALOG);
-        WindowManager.LayoutParams attrs = pd.getWindow().getAttributes();
+		sd = ShutdownDialog.create(context, 3);
+	}
 
-        attrs.alpha = setRebootDialogAlpha(context);
-	pd.getWindow().setDimAmount(setRebootDialogDim(context));
-
-        boolean isPrimary = UserHandle.getCallingUserId() == UserHandle.USER_OWNER;
-
-        int powermenuAnimations = isPrimary ? getPowermenuAnimations(context) : 0;
-        switch (powermenuAnimations) {
-           case 0:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationEnter;
-              attrs.gravity = Gravity.CENTER|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 1:
-              attrs.windowAnimations = R.style.GlobalActionsAnimation;
-              attrs.gravity = Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 2:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationTop;
-              attrs.gravity = Gravity.TOP|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 3:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationFly;
-              attrs.gravity = Gravity.CENTER_VERTICAL|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 4:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationTn;
-              attrs.gravity = Gravity.CENTER_VERTICAL|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 5:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationTranslucent;
-              attrs.gravity = Gravity.CENTER_VERTICAL|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 6:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationXylon;
-              attrs.gravity = Gravity.CENTER_VERTICAL|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 7:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationCard;
-              attrs.gravity = Gravity.CENTER_VERTICAL|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 8:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationTranslucent;
-              attrs.gravity = Gravity.TOP|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 9:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationTranslucent;
-              attrs.gravity = Gravity.BOTTOM|Gravity.CENTER_HORIZONTAL;
-           break;
-           case 10:
-              attrs.windowAnimations = R.style.GlobalActionsAnimationRotate;
-              attrs.gravity = Gravity.CENTER_VERTICAL|Gravity.CENTER_HORIZONTAL;
-           break;
-        }
-
-        if (!themeShutdownAnimationExists()) pd.show();
-        return pd;
-    }
-
-    private static boolean showSysuiReboot() {
-        Log.d(TAG, "Attempting to use SysUI shutdown UI");
-        try {
-            StatusBarManagerInternal service = LocalServices.getService(
-                    StatusBarManagerInternal.class);
-            if (service.showShutdownUi(mReboot, mReason)) {
-                // Sysui will handle shutdown UI.
-                Log.d(TAG, "SysUI handling shutdown UI");
-                return true;
-            }
-        } catch (Exception e) {
-            // If anything went wrong, ignore it and use fallback ui
-        }
-        Log.d(TAG, "SysUI is unavailable");
-        return false;
-    }
-
-    private static void beginShutdownSequence(Context context) {
-        synchronized (sIsStartedGuard) {
-            if (sIsStarted) {
-                Log.d(TAG, "Shutdown sequence already running, returning.");
-                return;
-            }
-            sIsStarted = true;
-        }
-
-        sInstance.mProgressDialog = showShutdownDialog(context);
+        sInstance.mShutdownDialog = sd;
         sInstance.mContext = context;
         sInstance.mPowerManager = (PowerManager)context.getSystemService(Context.POWER_SERVICE);
 
@@ -721,10 +608,10 @@ public final class ShutdownThread extends Thread {
         mHandler.post(new Runnable() {
             @Override
             public void run() {
-                if (mProgressDialog != null) {
-                    mProgressDialog.setProgress(progress);
+                if (mShutdownDialog != null) {
+                    //mShutdownDialog.setProgress(progress);
                     if (message != null) {
-                        mProgressDialog.setMessage(message);
+                        mShutdownDialog.setMessage(message);
                     }
                 }
             }
