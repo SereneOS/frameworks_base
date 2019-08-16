@@ -131,7 +131,6 @@ public class ScreenDecorations extends SystemUI implements Tunable {
     private void startOnScreenDecorationsThread() {
         mRotation = RotationUtils.getExactRotation(mContext);
         mWindowManager = mContext.getSystemService(WindowManager.class);
-
         updateRoundedCornerRadii();
         if (hasRoundedCorners() || shouldDrawCutout()) {
             setupDecorations();
